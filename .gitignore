@@ -1,0 +1,6 @@
+/target
+stub/target
+.env
+.DS_Store
+.idea/
+.claude/
