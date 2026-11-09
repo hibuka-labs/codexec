@@ -13,16 +13,58 @@ use crate::protocol::{
     BlockSpec, HostFrame, RoundConfig, WireLimits, WorkerFrame, decode_worker_line, encode_line,
 };
 use crate::registry::NamespaceRegistry;
-use crate::worker::{BlockError, BlockOutcome, RoundResult, Worker};
+use crate::worker::{BlockError, BlockOutcome, ProgressLine, RoundResult, Worker};
 use async_trait::async_trait;
 use phi_ns::{HostCall, NsError, NsObject, WorkerSink};
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
 /// The worker runtime itself (a Python source file, shipped inside the binary).
 const STUB: &str = include_str!("stub/worker.py");
+
+/// The mediation filters shared by the worker's hook and every Python child's
+/// hook (shipped beside the stub so both can import them).
+const AUDIT_FILTERS: &str = include_str!("stub/phi_audit.py");
+
+/// The child-process audit hook (shipped as `sitecustomize.py`: CPython's
+/// `site` module auto-imports it, which is how children inherit mediation).
+const CHILD_HOOK: &str = include_str!("stub/sitecustomize.py");
+
+/// Worker-directory sequence: joins the clock stamp so two spawns in the
+/// same tick still get distinct private directories.
+static SPAWN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Rolling tail of a worker's stderr — the diagnostics a killed round leaves
+/// behind (the worker's own stack dump rides stderr with a marker line).
+/// Fed by the drain task; read once when a round dies.
+#[derive(Clone, Default)]
+pub(crate) struct StderrRing(Arc<Mutex<VecDeque<String>>>);
+
+impl StderrRing {
+    /// How many lines the ring keeps.
+    const MAX: usize = 60;
+
+    fn push(&self, line: &str) {
+        let mut q = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if q.len() >= Self::MAX {
+            q.pop_front();
+        }
+        q.push_back(line.to_string());
+    }
+
+    /// Everything after the last stack-dump marker (knife②), capped — or
+    /// [`None`] when no dump landed (the round died before the worker could
+    /// say where it hung).
+    fn stack_dump(&self) -> Option<String> {
+        let q = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let start = q.iter().rposition(|l| l.trim() == "===PHI_STACK_DUMP===")? + 1;
+        let body: String = q.iter().skip(start).cloned().collect::<Vec<_>>().join("\n");
+        Some(body.chars().take(2000).collect())
+    }
+}
 
 /// Host side of one resident Python interpreter.
 pub struct PythonWorker {
@@ -34,6 +76,13 @@ pub struct PythonWorker {
     req_seq: u64,
     alive: bool,
     limits: Limits,
+    /// Where a hung round's diagnostics land (knife②).
+    stderr_ring: StderrRing,
+    /// The child-process audit channel (Unix only): every Python child the
+    /// cell spawns mediates its effects here before they run. Held for its
+    /// lifetime — dropping it stops the channel and removes the socket.
+    #[cfg(unix)]
+    _child_audit: Option<super::child_audit::ChildAudit>,
 }
 
 impl PythonWorker {
@@ -44,18 +93,72 @@ impl PythonWorker {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let stub_path =
-            std::env::temp_dir().join(format!("codexec-worker-{}-{stamp}.py", std::process::id()));
-        std::fs::write(&stub_path, STUB)
-            .map_err(|e| ExecError::Worker(format!("could not write worker stub: {e}")))?;
+        // A private directory holds the runtimes: the stub plus the two files
+        // its interpreter machinery pulls in (`phi_audit` for the shared
+        // mediation filters, `sitecustomize` for every Python child). Imports
+        // resolve them because the script's own directory is on `sys.path`.
+        //
+        // The name is terse on purpose: the audit socket lives here too, and a
+        // Unix socket path must fit `sun_path` (~104 bytes on macOS) even when
+        // `temp_dir()` is a long one. A process-wide sequence joins the stamp:
+        // two spawns inside the same clock tick must not share the directory.
+        // The script filename keeps its speaking `codexec-worker-` prefix —
+        // that is what the child hook's argv0 guard matches on to skip double
+        // mediation.
+        let seq = SPAWN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("cw-{}-{seq:x}-{stamp:x}", std::process::id()));
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| ExecError::Worker(format!("could not create worker dir: {e}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+        let stub_path = dir.join(format!("codexec-worker-{}-{stamp}.py", std::process::id()));
+        write_runtime(&stub_path, STUB)?;
+        write_runtime(&dir.join("phi_audit.py"), AUDIT_FILTERS)?;
+        write_runtime(&dir.join("sitecustomize.py"), CHILD_HOOK)?;
+
+        // The child audit channel (Unix): every Python child a cell spawns
+        // connects back through `PHI_AUDIT_SOCK` and its mediated effects
+        // decide + journal at the same chokepoint as everything else. Without
+        // the channel the worker refuses to boot — audit cannot be turned off.
+        #[cfg(unix)]
+        let child_audit = match super::child_audit::ChildAudit::start(Arc::clone(&registry), &dir) {
+            Ok(listener) => Some(listener),
+            Err(e) => {
+                return Err(ExecError::Worker(format!(
+                    "child audit channel must bind: {e}"
+                )));
+            }
+        };
 
         // Override for exotic installs; `python3` is the platform default.
         let python = std::env::var("CODEXEC_PYTHON").unwrap_or_else(|_| "python3".to_string());
-        let (child, stdin, stdout, stderr) = spawn_process(&python, &stub_path)
+        #[cfg(unix)]
+        let child_env = {
+            let mut python_path = dir.clone().into_os_string();
+            if let Some(existing) = std::env::var_os("PYTHONPATH") {
+                python_path.push(":");
+                python_path.push(existing);
+            }
+            let sock = child_audit
+                .as_ref()
+                .expect("bound above")
+                .sock_path()
+                .as_os_str()
+                .to_os_string();
+            vec![("PHI_AUDIT_SOCK", sock), ("PYTHONPATH", python_path)]
+        };
+        #[cfg(not(unix))]
+        let child_env: Vec<(&str, std::ffi::OsString)> = Vec::new();
+        let (child, stdin, stdout, stderr) = spawn_process(&python, &stub_path, &child_env)
             .map_err(|e| ExecError::Worker(format!("could not spawn python worker: {e}")))?;
         // Diagnostics stay visible (session log) without the screen damage —
-        // the original intent of a shared terminal, none of the painting.
-        tokio::spawn(drain_worker_stderr(stderr));
+        // the original intent of a shared terminal, none of the painting. The
+        // ring keeps the tail so a timeout error can say where the round hung.
+        let stderr_ring = StderrRing::default();
+        tokio::spawn(drain_worker_stderr(stderr, stderr_ring.clone()));
 
         Ok(Self {
             child,
@@ -66,6 +169,9 @@ impl PythonWorker {
             req_seq: 0,
             alive: true,
             limits,
+            stderr_ring,
+            #[cfg(unix)]
+            _child_audit: child_audit,
         })
     }
 
@@ -318,6 +424,12 @@ impl WorkerSink for PythonWorker {
     }
 }
 
+/// Write one shipped runtime file into the worker's private directory.
+fn write_runtime(path: &std::path::Path, body: &str) -> Result<(), ExecError> {
+    std::fs::write(path, body)
+        .map_err(|e| ExecError::Worker(format!("could not write {}: {e}", path.display())))
+}
+
 /// Spawn the interpreter under the one contract that keeps it off the
 /// user's terminal (same as agent-works' MCP client): stdin/stdout carry the
 /// protocol and nothing else, stderr is **piped** — never `inherit()`. An
@@ -328,15 +440,18 @@ impl WorkerSink for PythonWorker {
 fn spawn_process(
     python: &str,
     script: &std::path::Path,
+    child_env: &[(&str, std::ffi::OsString)],
 ) -> std::io::Result<(Child, ChildStdin, ChildStdout, ChildStderr)> {
-    let mut child = Command::new(python)
+    let mut child = Command::new(python);
+    child
         .arg("-u")
         .arg(script)
+        .envs(child_env.iter().map(|(k, v)| (*k, v.clone())))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
+        .kill_on_drop(true);
+    let mut child = child.spawn()?;
     let stdin = child
         .stdin
         .take()
@@ -352,10 +467,12 @@ fn spawn_process(
     Ok((child, stdin, stdout, stderr))
 }
 
-/// Drain a worker's stderr into the log, one line per diagnostic.
-async fn drain_worker_stderr(stderr: ChildStderr) {
+/// Drain a worker's stderr into the log, one line per diagnostic — and into
+/// the ring the timeout path reads (knife②).
+async fn drain_worker_stderr(stderr: ChildStderr, ring: StderrRing) {
     let mut lines = BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
+        ring.push(&line);
         tracing::warn!(%line, "codexec python worker stderr");
     }
 }
@@ -385,12 +502,29 @@ impl Worker for PythonWorker {
         .await?;
 
         let mut outcomes: Vec<BlockOutcome> = Vec::new();
+        let mut progress: Vec<ProgressLine> = Vec::new();
         let mut compile_error: Option<BlockError> = None;
         let mut compile_error_index: Option<usize> = None;
 
         loop {
             match self.recv().await? {
                 None => return Err(ExecError::Worker("worker exited mid-round".into())),
+                Some(WorkerFrame::Progress {
+                    request_id,
+                    index,
+                    at_ms,
+                    text,
+                }) => {
+                    if request_id != rid {
+                        continue;
+                    }
+                    // The trail is bounded here (the worker already truncates
+                    // each tick's text): first ticks win, a runaway round
+                    // cannot grow the observation without limit.
+                    if progress.len() < 100 {
+                        progress.push(ProgressLine { index, at_ms, text });
+                    }
+                }
                 Some(WorkerFrame::BlockResult {
                     request_id,
                     index,
@@ -457,6 +591,7 @@ impl Worker for PythonWorker {
                         compile_error,
                         compile_error_index,
                         stopped_at,
+                        progress,
                     });
                 }
                 Some(_) => continue,
@@ -466,6 +601,10 @@ impl Worker for PythonWorker {
 
     fn is_alive(&self) -> bool {
         self.alive
+    }
+
+    fn diagnostics_tail(&self) -> Option<String> {
+        self.stderr_ring.stack_dump()
     }
 
     fn kill(&mut self) {
@@ -512,7 +651,7 @@ mod tests {
         let script = dir.path().join("probe.py");
         std::fs::write(&script, "import os\nos.write(2, b'FD2LEAK\\n')\n").expect("write probe");
         let (mut child, _stdin, _stdout, stderr) =
-            spawn_process("python3", &script).expect("probe spawns");
+            spawn_process("python3", &script, &[]).expect("probe spawns");
         let mut seen = Vec::new();
         let mut stderr = stderr;
         stderr.read_to_end(&mut seen).await.expect("drain");

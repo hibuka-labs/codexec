@@ -167,6 +167,19 @@ pub enum WorkerFrame {
         /// Which block was running.
         cell_index: usize,
     },
+    /// A progress tick while a round runs: what a block printed (throttled)
+    /// and how long it has been going. The observation itself is atomic to
+    /// the model — the trail makes the run legible after it ends.
+    Progress {
+        /// Correlation id.
+        request_id: String,
+        /// 0-based block index in flight.
+        index: usize,
+        /// Milliseconds since round start.
+        at_ms: u64,
+        /// The tick text (worker-side truncated).
+        text: String,
+    },
     /// End of one request.
     Done {
         /// Correlation id.

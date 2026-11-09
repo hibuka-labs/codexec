@@ -23,14 +23,39 @@ import time
 import traceback
 import warnings
 
+from phi_audit import AUDIT_CALL as _AUDIT_CALL
+from phi_audit import jsonable as _jsonable
+from phi_audit import mediate as _mediate
+
 _NS = {"__name__": "__main__"}
 _inbox = []
 _call_seq = 0
 _current_cell = [0]
+# Round start in `time.monotonic()` terms — progress ticks are stamped from it.
+_round_start = [0.0]
+
+# One frame per write, under a lock: progress ticks fire from the heartbeat
+# thread and a torn frame would poison the protocol for every consumer.
+_send_lock = threading.Lock()
 
 
 def _send(obj):
-    os.write(1, (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
+    line = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+    with _send_lock:
+        os.write(1, line)
+
+
+def _progress(rid, index, text):
+    """One progress tick on the protocol channel: what a cell printed and how
+    long the round has been running. The observation reaches the model only
+    when the round ends — this trail is what makes the run legible after."""
+    _send({
+        "kind": "progress",
+        "request_id": rid,
+        "index": index,
+        "at_ms": int((time.monotonic() - _round_start[0]) * 1000),
+        "text": text[:200],
+    })
 
 
 def _next_frame():
@@ -62,28 +87,37 @@ def _tail(text, max_lines=20):
 # when several threads (or the audit hook) call home concurrently.
 _call_lock = threading.RLock()
 
+# How many host calls are in flight right now. `threading.RLock` has no
+# `locked()`, and the heartbeat's "is a call suspended?" question is about
+# the call, not about the lock.
+_in_call = [0]
+
 
 def _phi_call(name, args):
     global _call_seq
     with _call_lock:
-        _call_seq += 1
-        call_id = "c%d" % _call_seq
-        _send({
-            "kind": "host_call",
-            "call_id": call_id,
-            "fn": name,
-            "args": list(args),
-            "cell_index": _current_cell[0],
-        })
-        while True:
-            frame = _next_frame()
-            if frame is None:
-                raise RuntimeError("host closed the channel during host_call")
-            if frame.get("kind") == "host_result" and frame.get("call_id") == call_id:
-                if frame.get("ok"):
-                    return frame.get("value")
-                raise RuntimeError(frame.get("error") or "host call failed")
-            _inbox.append(frame)
+        _in_call[0] += 1
+        try:
+            _call_seq += 1
+            call_id = "c%d" % _call_seq
+            _send({
+                "kind": "host_call",
+                "call_id": call_id,
+                "fn": name,
+                "args": list(args),
+                "cell_index": _current_cell[0],
+            })
+            while True:
+                frame = _next_frame()
+                if frame is None:
+                    raise RuntimeError("host closed the channel during host_call")
+                if frame.get("kind") == "host_result" and frame.get("call_id") == call_id:
+                    if frame.get("ok"):
+                        return frame.get("value")
+                    raise RuntimeError(frame.get("error") or "host call failed")
+                _inbox.append(frame)
+        finally:
+            _in_call[0] -= 1
 
 
 _NS["_phi_call"] = _phi_call
@@ -183,121 +217,30 @@ _NS["_phi_define_docs"] = _phi_define_docs
 # Every mediated stdlib event becomes one call-row at the host-call seam:
 # decide → journal write-ahead → let the effect run. Raising here blocks the
 # operation (fail-closed) and the exception surfaces on the effect's call
-# site. The event set below is the pre-filter and must match the host's
-# classifier table exactly (`codexec/src/audit.rs`); a test enforces that.
-
-_AUDIT_CALL = "__audit__"
-
-_MEDIATED = frozenset((
-    "ctypes.dlopen",
-    "ctypes.dlsym",
-    "open",
-    "os.chflags",
-    "os.chmod",
-    "os.chown",
-    "os.exec",
-    "os.fork",
-    "os.kill",
-    "os.killpg",
-    "os.link",
-    "os.listdir",
-    "os.mkdir",
-    "os.posix_spawn",
-    "os.rename",
-    "os.remove",
-    "os.rmdir",
-    "os.scandir",
-    "os.symlink",
-    "os.system",
-    "os.truncate",
-    "os.utime",
-    "shutil.copyfile",
-    "shutil.copymode",
-    "shutil.copystat",
-    "shutil.move",
-    "shutil.rmtree",
-    "socket.bind",
-    "socket.connect",
-    "socket.getaddrinfo",
-    "socket.gethostbyname",
-    "socket.sendto",
-    "subprocess.Popen",
-))
-
-# Interpreter plumbing — the caller frame of these opens is the import/debug
-# machinery, not the model's code. pathlib/os/shutil are deliberately NOT
-# here: user calls through them must be mediated (their module-top-level
-# effects during import ARE mediated too — caller is the module frame).
-_INTERNAL_PREFIXES = (
-    "_frozen_importlib", "importlib", "zipimport",
-    "linecache", "tokenize", "traceback", "bdb", "pdb",
-)
+# site. The event set and the call-site filters live in `phi_audit` (shared
+# with every Python child's `sitecustomize.py` hook) and must match the
+# host's classifier table exactly (`codexec/src/audit.rs`); tests enforce it.
 
 # Per-thread re-entrancy guard: a mediated event fired from inside the hook's
 # own plumbing (e.g. `repr` of a hostile arg) must not recurse into the RPC.
 _hook_state = threading.local()
 
 
-def _open_rw(mode, flags):
-    """Decode `open`'s mode/flags to "read"/"write" with the interpreter's own
-    constants — the flag bits are platform-specific and belong here."""
-    if isinstance(mode, str) and any(c in mode for c in "wax+"):
-        return "write"
-    wbits = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
-    try:
-        if flags & wbits:
-            return "write"
-    except TypeError:
-        pass
-    return "read"
-
-
-def _jsonable(a):
-    """One event arg → JSON-safe. Digest correlation, not payload fidelity."""
-    if a is None or isinstance(a, (bool, int, float, str)):
-        return a
-    if isinstance(a, (bytes, bytearray)):
-        return bytes(a).decode("utf-8", "replace")
-    if isinstance(a, (list, tuple)):
-        return [_jsonable(x) for x in a]
-    return repr(a)[:200]
-
-
-def _is_pseudo_path(path):
-    """Compile/exec labels — not effect targets. CPython's error rendering
-    fetches source lines for them (a failed `ast.parse` in the traceback
-    caret extraction opens `<unknown>`; a D2 syntax error opens `<cell N>`),
-    and those fetches must not become ledger rows. Residual hole (§8.4): a
-    real file literally named `<unknown>` etc. would pass silent."""
-    if not isinstance(path, str):
-        return False  # int paths are open fds — real targets
-    if path in ("<unknown>", "<string>", "<stdin>", "<console>",
-                "<install>", "<cell>"):
-        return True
-    return path.startswith("<cell ") and path.endswith(">")
-
-
 def _audit_hook(event, args):
-    if event not in _MEDIATED:
-        return
     if getattr(_hook_state, "depth", 0):
         return
-    if event == "open" and _is_pseudo_path(args[0] if args else None):
-        return
-    try:
-        caller = sys._getframe(1)
-    except ValueError:
-        return
-    name = caller.f_globals.get("__name__") or ""
-    if isinstance(name, str) and name.startswith(_INTERNAL_PREFIXES):
-        return
-    if event == "open":
-        rw = _open_rw(args[1] if len(args) > 1 else None,
-                      args[2] if len(args) > 2 else 0)
-    else:
-        rw = ""
+    # Arm the guard *first*: `sys._getframe` is itself an audited event, so
+    # asking for the caller would re-enter this hook forever. Everything the
+    # hook does (frame grab, filtering, the RPC) runs under the guard.
     _hook_state.depth = 1
     try:
+        try:
+            caller = sys._getframe(1)
+        except ValueError:
+            return
+        rw = _mediate(event, args, caller)
+        if rw is None:
+            return
         _phi_call(_AUDIT_CALL, [event, [_jsonable(a) for a in args], rw])
     finally:
         _hook_state.depth = 0
@@ -401,8 +344,31 @@ def _cap(text, limit):
     return text[:cut] + "\n…[truncated]", True
 
 
-def _run_block(tree, stdout_cap, stderr_cap, pre_err=()):
-    out_buf, err_buf = io.StringIO(), io.StringIO()
+class _Tee(io.StringIO):
+    """Capture stream that also ticks the progress trail: what a cell prints
+    is legible while the round runs, not only when it ends. Ticks are
+    throttled (one per 250ms per stream) and truncated — the full body still
+    rides back on the block result; this is a trail, not a second channel."""
+    _THROTTLE = 0.25
+
+    def __init__(self, rid, index):
+        super().__init__()
+        self._rid = rid
+        self._index = index
+        self._last = 0.0
+
+    def write(self, s):
+        n = super().write(s)
+        now = time.monotonic()
+        text = s.strip()
+        if text and now - self._last >= self._THROTTLE:
+            self._last = now
+            _progress(self._rid, self._index, text.replace("\n", " / "))
+        return n
+
+
+def _run_block(tree, stdout_cap, stderr_cap, pre_err=(), rid="", index=0):
+    out_buf, err_buf = _Tee(rid, index), _Tee(rid, index)
     old_out, old_err = sys.stdout, sys.stderr
     sys.stdout, sys.stderr = out_buf, err_buf
     error = None
@@ -455,56 +421,109 @@ def _done(rid, phase, started, exit_code, error=None, stopped_at=None):
     })
 
 
+def _dump_stack():
+    """Where every thread is stuck, on fd 2 (the host drains stderr into the
+    ring the timeout error reads). Marker first so the host can find the dump
+    among ordinary diagnostics."""
+    try:
+        os.write(2, b"\n===PHI_STACK_DUMP===\n")
+        import faulthandler
+        faulthandler.dump_traceback(file=os.fdopen(2, "w", closefd=False))
+    except Exception:
+        pass
+
+
+def _heartbeat(rid, started, timeout_ms, stop):
+    """Progress ticks (one per `interval` while a round runs) plus a stack
+    dump just before the round's hard deadline and every tick after it: a hung
+    cell leaves "where it stuck" behind instead of only "timeout", and the dump
+    stays fresh through the hang. The dump never fires while a host call is in
+    flight — a cell suspended for human consent is not a stuck cell (the round
+    budget freezes with it, so the deadline must not count that time either).
+
+    `started` is wall clock (the `done` frame's elapsed); the deadline runs on
+    the monotonic clock — mixing the two in one comparison is how the dump
+    silently never fires."""
+    t0 = time.monotonic()
+    interval = min(5.0, max(0.5, timeout_ms / 4000.0))
+    deadline = t0 + (timeout_ms / 1000.0) * 0.9
+    while True:
+        now = time.monotonic()
+        wait = interval
+        if now < deadline:
+            wait = min(wait, deadline - now)
+        if stop.wait(wait):
+            return
+        if time.monotonic() >= deadline and not _in_call[0]:
+            _dump_stack()
+            continue
+        _progress(rid, _current_cell[0], "still running")
+
+
 def _handle_exec(rid, frame):
     started = time.time()
+    _round_start[0] = time.monotonic()
     blocks = frame.get("blocks") or []
-    limits = (frame.get("config") or {}).get("limits") or {}
+    config = frame.get("config") or {}
+    limits = config.get("limits") or {}
     stdout_cap = int(limits.get("stdout", 262144))
     stderr_cap = int(limits.get("stderr", 65536))
+    timeout_ms = int(config.get("timeout_ms") or 120000)
 
-    # D2: validate every block before running any of them. The parse itself
-    # emits warnings (e.g. SyntaxWarning on an invalid escape) and this pass
-    # runs outside `_run_block`'s capture — record them per block and hand
-    # them to that block's stderr instead of leaking them to the real one.
-    trees = []
-    parse_notes = []
-    for i, block in enumerate(blocks):
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            try:
-                trees.append(ast.parse(block.get("code") or "", "<cell %d>" % i))
-            except SyntaxError as exc:
-                error = {
-                    "kind": type(exc).__name__,
-                    "message": str(exc),
-                    "traceback": _tail(traceback.format_exc()),
-                }
-                _done(rid, "exec", started, 1, error=error, stopped_at=i)
-                return
-        parse_notes.append([
-            "%s:%s: %s: %s" % (w.filename, w.lineno, w.category.__name__, w.message)
-            for w in caught
-        ])
+    stop = threading.Event()
+    beater = threading.Thread(target=_heartbeat,
+                              args=(rid, started, timeout_ms, stop), daemon=True)
+    beater.start()
+    try:
+        # D2: validate every block before running any of them. The parse itself
+        # emits warnings (e.g. SyntaxWarning on an invalid escape) and this pass
+        # runs outside `_run_block`'s capture — record them per block and hand
+        # them to that block's stderr instead of leaking them to the real one.
+        trees = []
+        parse_notes = []
+        for i, block in enumerate(blocks):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                try:
+                    trees.append(ast.parse(block.get("code") or "", "<cell %d>" % i))
+                except SyntaxError as exc:
+                    error = {
+                        "kind": type(exc).__name__,
+                        "message": str(exc),
+                        "traceback": _tail(traceback.format_exc()),
+                    }
+                    _done(rid, "exec", started, 1, error=error, stopped_at=i)
+                    return
+            parse_notes.append([
+                "%s:%s: %s: %s" % (w.filename, w.lineno, w.category.__name__, w.message)
+                for w in caught
+            ])
 
-    stopped_at = None
-    for i, tree in enumerate(trees):
-        _current_cell[0] = i
-        out, err, error = _run_block(tree, stdout_cap, stderr_cap, parse_notes[i])
-        _send({
-            "kind": "block_result",
-            "request_id": rid,
-            "index": i,
-            "stdout": out,
-            "stderr": err,
-            "error": error,
-            "ns": ns_entries(),
-        })
-        if error is not None:
-            stopped_at = i
-            break
+        stopped_at = None
+        for i, tree in enumerate(trees):
+            _current_cell[0] = i
+            # Children of this block inherit the attribution (sitecustomize
+            # stamps their events with it).
+            os.environ["PHI_CELL"] = str(i)
+            out, err, error = _run_block(tree, stdout_cap, stderr_cap,
+                                         parse_notes[i], rid, i)
+            _send({
+                "kind": "block_result",
+                "request_id": rid,
+                "index": i,
+                "stdout": out,
+                "stderr": err,
+                "error": error,
+                "ns": ns_entries(),
+            })
+            if error is not None:
+                stopped_at = i
+                break
 
-    _done(rid, "exec", started, 0 if stopped_at is None else 1,
-          stopped_at=stopped_at)
+        _done(rid, "exec", started, 0 if stopped_at is None else 1,
+              stopped_at=stopped_at)
+    finally:
+        stop.set()
 
 
 def _handle_eval(rid, frame):

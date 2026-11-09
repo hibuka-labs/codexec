@@ -10,14 +10,16 @@
 //! Two lists define the surface and must not drift:
 //!
 //! - `MEDIATED_EVENTS` here — the classification table's keys;
-//! - `_MEDIATED` in `workers/python/stub/worker.py` — the hook's pre-filter.
+//! - `MEDIATED` in `workers/python/stub/phi_audit.py` — the pre-filter both
+//!   audit hooks apply (the resident worker's and every Python child's).
 //!
 //! The tests below parse the stub and assert they are the same set (and that
-//! the stub calls back on this module's reserved name). Events not on the
+//! the hooks call back on this module's reserved name). Events not on the
 //! list pass silent (interpreter plumbing: `import`, `exec`, `compile`,
 //! `marshal.loads`, …), and the hole that remains after mediation is
 //! documented in codexec-design §8.4: ctypes calls past the bind point,
-//! `os.stat`-level reads, C-extension-internal syscalls.
+//! `os.stat`-level reads, C-extension-internal syscalls — plus non-Python
+//! subprocesses (the child channel mediates Python children only).
 
 use phi_cap::Capability;
 
@@ -136,14 +138,14 @@ mod tests {
     fn the_stub_hook_set_matches_this_table() {
         // The two lists are the same surface seen from each side; a drift
         // would silently un-mediate effects (the stub filters first).
-        let stub = include_str!("workers/python/stub/worker.py");
+        let stub = include_str!("workers/python/stub/phi_audit.py");
         let block = stub
-            .split("_MEDIATED = frozenset((")
+            .split("MEDIATED = frozenset((")
             .nth(1)
-            .expect("worker.py declares _MEDIATED")
+            .expect("phi_audit.py declares MEDIATED")
             .split("))")
             .next()
-            .expect("_MEDIATED closes");
+            .expect("MEDIATED closes");
         let mut from_stub: Vec<&str> = block
             .lines()
             .map(|l| l.trim().trim_matches(',').trim())
@@ -153,16 +155,28 @@ mod tests {
         from_stub.sort_unstable();
         let mut from_table: Vec<&str> = MEDIATED_EVENTS.to_vec();
         from_table.sort_unstable();
-        assert_eq!(from_stub, from_table, "worker.py _MEDIATED drifted");
+        assert_eq!(from_stub, from_table, "phi_audit.py MEDIATED drifted");
     }
 
     #[test]
-    fn the_stub_calls_back_on_this_reserved_name() {
+    fn the_hooks_call_back_on_this_reserved_name() {
         // A drift here would land audit calls as undeclared pack methods.
-        let stub = include_str!("workers/python/stub/worker.py");
+        let filters = include_str!("workers/python/stub/phi_audit.py");
         assert!(
-            stub.contains(&format!("_AUDIT_CALL = \"{AUDIT_CALL}\"")),
-            "worker.py must name _AUDIT_CALL = {AUDIT_CALL:?}"
+            filters.contains(&format!("AUDIT_CALL = \"{AUDIT_CALL}\"")),
+            "phi_audit.py must name AUDIT_CALL = {AUDIT_CALL:?}"
+        );
+        // Both hook halves take the wire name and the filters from the shared
+        // module — no private copies that could drift apart.
+        let worker = include_str!("workers/python/stub/worker.py");
+        assert!(
+            worker.contains("from phi_audit import"),
+            "worker.py must import the shared mediation filters"
+        );
+        let child = include_str!("workers/python/stub/sitecustomize.py");
+        assert!(
+            child.contains("from phi_audit import"),
+            "sitecustomize.py must import the shared mediation filters"
         );
     }
 }

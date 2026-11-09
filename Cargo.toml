@@ -1,6 +1,6 @@
 [package]
 name = "codexec"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "CodeAct execution layer: code cells as actions, policy-gated and journaled"
 license = "MIT"
@@ -28,6 +28,7 @@ tokio = { version = "1", features = [
     "io-util",
     "time",
     "sync",
+    "net",
 ] }
 
 [dev-dependencies]

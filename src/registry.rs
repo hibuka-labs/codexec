@@ -10,7 +10,7 @@
 use crate::artifacts::ArtifactHub;
 use crate::interact::{InteractionBridge, InteractionSlot, SuspensionClock};
 use crate::journal::JournalHandle;
-use crate::observation::ExecError;
+use crate::observation::{CellEffects, ExecError};
 use crate::policy::{CallFacts, Policy, PolicyDecision, decide_and_journal, hold_error};
 use phi_cap::Capability;
 use phi_ns::capture::{CAPTURE_ID_KEY, CAPTURE_KEY, CaptureLedger, CaptureUse, face_of};
@@ -73,6 +73,10 @@ pub struct NamespaceRegistry {
     /// Suspended-interaction clock — the round timeout freezes while a human
     /// is answering ([`SuspensionClock`]).
     clock: Arc<SuspensionClock>,
+    /// Per-cell effect tally for the current round (knife①): every decided
+    /// effect — host call or PEP 578 audit event — counts here, and the fold
+    /// hands the summary back to the model.
+    effects: Mutex<Vec<CellEffects>>,
 }
 
 /// What a policy hold looked like — surfaced to the observation stream.
@@ -102,6 +106,7 @@ impl NamespaceRegistry {
             interaction: Mutex::new(None),
             artifacts: Mutex::new(None),
             clock: Arc::new(SuspensionClock::default()),
+            effects: Mutex::new(Vec::new()),
         }
     }
 
@@ -286,10 +291,14 @@ impl NamespaceRegistry {
     }
 
     /// Clear a previous round's policy hold and any undrained images or
-    /// queued observation events.
+    /// queued observation events. The effect tally clears with it — each
+    /// round reports its own effects (late stragglers from a killed child
+    /// surface in the next round's tally; their rows are in the journal
+    /// regardless).
     pub fn clear_hold(&self) {
         *self.last_hold.lock().expect("hold poisoned") = None;
         self.images.lock().expect("images poisoned").clear();
+        self.effects.lock().expect("effects poisoned").clear();
         if let Some(hub) = self.artifacts() {
             hub.take_queued();
         }
@@ -310,6 +319,43 @@ impl NamespaceRegistry {
     /// Take every image harvested this round (cell order preserved).
     pub fn take_events(&self) -> Vec<ScopedImage> {
         std::mem::take(&mut *self.images.lock().expect("images poisoned"))
+    }
+
+    /// Take the round's per-cell effect tally (knife①), in cell order with
+    /// counts in O7 class order. One entry per cell that produced at least
+    /// one decided row.
+    pub fn take_effects(&self) -> Vec<CellEffects> {
+        let mut out = std::mem::take(&mut *self.effects.lock().expect("effects poisoned"));
+        out.sort_by_key(|e| e.cell_index);
+        for e in &mut out {
+            e.counts.sort_by_key(|(c, _)| *c);
+        }
+        out
+    }
+
+    /// Count one decided effect toward the round tally. The journal row is
+    /// the audit record; this is its model-facing digest.
+    fn tally(&self, cap: Capability, cell_index: usize, decision: PolicyDecision) {
+        let mut effects = self.effects.lock().expect("effects poisoned");
+        let entry = match effects.iter().position(|e| e.cell_index == cell_index) {
+            Some(i) => &mut effects[i],
+            None => {
+                effects.push(CellEffects {
+                    cell_index,
+                    counts: Vec::new(),
+                    denied: 0,
+                });
+                effects.last_mut().expect("just pushed")
+            }
+        };
+        if decision.is_allow() {
+            match entry.counts.iter_mut().find(|(c, _)| *c == cap) {
+                Some((_, n)) => *n += 1,
+                None => entry.counts.push((cap, 1)),
+            }
+        } else {
+            entry.denied += 1;
+        }
     }
 
     /// The single dispatch point: look up the declaration, decide, journal
@@ -347,6 +393,7 @@ impl NamespaceRegistry {
             },
         )
         .await?;
+        self.tally(f.cap, cell_index, decision);
 
         if !decision.is_allow() {
             return Err(self.refuse(decision, reason, fn_name, f.cap, cell_index));
@@ -420,6 +467,7 @@ impl NamespaceRegistry {
             },
         )
         .await?;
+        self.tally(cap, cell_index, decision);
         if !decision.is_allow() {
             return Err(self.refuse(decision, reason, event, cap, cell_index));
         }
@@ -453,6 +501,7 @@ impl NamespaceRegistry {
             },
         )
         .await?;
+        self.tally(cap, cell_index, resolved.0);
         if !resolved.0.is_allow() {
             *self.last_hold.lock().expect("hold poisoned") = Some(HoldRecord {
                 decision: resolved.0,

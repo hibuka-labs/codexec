@@ -5,6 +5,7 @@
 //! should never have to guess what is still alive.
 
 use crate::policy::PolicyDecision;
+use phi_cap::Capability;
 use phi_ns::ImageRef;
 use thiserror::Error;
 
@@ -43,6 +44,21 @@ pub enum CellEvent {
     },
 }
 
+/// One cell's mediated-effect tally for the round: what the world actually
+/// did while the cell ran, counted at the same chokepoint the journal rows
+/// land on (host calls and PEP 578 audit events alike). The ledger has always
+/// recorded these — the tally brings them back to the model, which otherwise
+/// only sees what the code chose to print.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CellEffects {
+    /// 0-based cell the effects are attributed to.
+    pub cell_index: usize,
+    /// Allowed effects per capability class, in O7 order (Pure first).
+    pub counts: Vec<(Capability, usize)>,
+    /// Effects policy refused (deny / hold) — the step may have halted on one.
+    pub denied: usize,
+}
+
 /// What one step produced (codexec-design §4.3).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Observation {
@@ -54,6 +70,12 @@ pub struct Observation {
     pub error: Option<ExecError>,
     /// Side-channel events.
     pub events: Vec<CellEvent>,
+    /// The round's progress trail, already stamped (`"[12.3s] downloaded 40%"`)
+    /// — what the run looked like while it ran (knife③).
+    pub progress: Vec<String>,
+    /// Per-cell effect tally (knife①): what the world did, not only what the
+    /// code printed. One entry per cell that produced at least one row.
+    pub effects: Vec<CellEffects>,
 }
 
 impl Observation {
@@ -83,10 +105,14 @@ pub enum ExecError {
     SessionReset,
 
     /// The round hit its hard timeout; the worker is recycled.
-    #[error("timeout: round exceeded {timeout_ms}ms; worker recycled")]
+    /// `where_it_stuck` carries the worker's own stack dump when it managed to
+    /// emit one before the kill (knife②) — a hang now says where it hung.
+    #[error("timeout: round exceeded {timeout_ms}ms; worker recycled{}", .where_it_stuck.as_deref().map(|s| format!("\n{s}")).unwrap_or_default())]
     Timeout {
         /// The configured round timeout.
         timeout_ms: u64,
+        /// Where the round hung, when known.
+        where_it_stuck: Option<String>,
     },
 
     /// A block failed to compile — **no block ran** (D2).

@@ -39,6 +39,18 @@ pub struct BlockError {
     pub traceback: Option<String>,
 }
 
+/// One progress tick of a round (the trail that makes a run legible after it
+/// ends — the observation itself is atomic to the model).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgressLine {
+    /// 0-based block index in flight when the tick fired.
+    pub index: usize,
+    /// Milliseconds since round start.
+    pub at_ms: u64,
+    /// The tick text ("still running", a throttled print chunk, …).
+    pub text: String,
+}
+
 /// What one round produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoundResult {
@@ -53,6 +65,9 @@ pub struct RoundResult {
     pub compile_error_index: Option<usize>,
     /// Block index where execution stopped early (uncaught exception / hold).
     pub stopped_at: Option<usize>,
+    /// The round's progress trail, in tick order. Bounded by the worker: at
+    /// most 100 ticks of at most 200 chars each.
+    pub progress: Vec<ProgressLine>,
 }
 
 /// The resident execution environment.
@@ -70,4 +85,11 @@ pub trait Worker: WorkerSink {
 
     /// Graceful shutdown.
     async fn shutdown(&mut self) -> Result<(), ExecError>;
+
+    /// Diagnostics tail for the timeout path: where a stuck round was when it
+    /// hung (the worker's own stack dump), or [`None`] when the worker keeps
+    /// no such buffer. Read **before** [`Worker::kill`].
+    fn diagnostics_tail(&self) -> Option<String> {
+        None
+    }
 }

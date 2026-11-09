@@ -175,9 +175,15 @@ impl<W: Worker> CodeCellExecutor<W> {
 
         match result {
             None => {
+                // Read the stuck worker's stack dump before the kill (knife②):
+                // a timeout now says where the round hung, not just that it did.
+                let tail = self.worker.as_ref().and_then(|w| w.diagnostics_tail());
                 self.lose_worker();
                 let mut obs = Observation {
-                    error: Some(ExecError::Timeout { timeout_ms }),
+                    error: Some(ExecError::Timeout {
+                        timeout_ms,
+                        where_it_stuck: tail,
+                    }),
                     ..Observation::empty()
                 };
                 // Pictures taken before the kill still happened — fold them.
@@ -199,8 +205,8 @@ impl<W: Worker> CodeCellExecutor<W> {
     }
 
     /// Fold whatever the round harvested into an out-of-band observation —
-    /// images and any queued observation events (the round died mid-flight;
-    /// what happened before the kill still happened).
+    /// images, any queued observation events, and the effect tally (the round
+    /// died mid-flight; what happened before the kill still happened).
     fn drain_images_into(&self, obs: &mut Observation) {
         let mut budget = RoundBudget::new();
         for scoped in self.registry.take_events() {
@@ -213,6 +219,7 @@ impl<W: Worker> CodeCellExecutor<W> {
                 }
             }
         }
+        obs.effects = self.registry.take_effects();
     }
 
     /// Spill a cut body into the artifact store (M3c, action-executor-design
@@ -325,6 +332,19 @@ impl<W: Worker> CodeCellExecutor<W> {
                 }
             }
         }
+
+        // The progress trail (knife③): what the round looked like while it
+        // ran. Bounded upstream (100 ticks of 200 chars), so it rides uncut.
+        for tick in &round.progress {
+            obs.progress.push(format!(
+                "[{:.1}s] {}",
+                tick.at_ms as f64 / 1000.0,
+                tick.text
+            ));
+        }
+        // The effect tally (knife①): what the world did, per cell — the
+        // journal keeps the rows, the model gets the digest.
+        obs.effects = self.registry.take_effects();
 
         // Precedence: a policy hold outranks any cell-level error — the step
         // halted on the audit decision, not on the raise it produced.
