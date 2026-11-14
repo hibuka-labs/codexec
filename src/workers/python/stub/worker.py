@@ -62,10 +62,16 @@ def _next_frame():
     while True:
         if _inbox:
             return _inbox.pop(0)
-        line = sys.stdin.readline()
+        # The wire is UTF-8 bytes (serde_json on the host writes UTF-8), but
+        # the text layer of stdin is the machine's locale: on Windows that is
+        # the ANSI code page with `surrogateescape`, which folds every
+        # non-ASCII byte of model code into mojibake and lone surrogates (and
+        # then `compile()` refuses them). Read bytes; the wire's codec is the
+        # contract's, never the machine's.
+        line = sys.stdin.buffer.readline()
         if not line:
             return None
-        line = line.strip()
+        line = line.decode("utf-8").strip()
         if not line:
             continue
         try:
