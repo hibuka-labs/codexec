@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-16
+
+### Fixed
+- **The worker reads the wire as bytes, not as locale text.** A UTF-8
+  payload split across the socket boundary used to go through the
+  platform's locale decoding, which on a non-UTF-8 locale mangled the
+  bytes and failed the frame. The wire is bytes; it is now read as bytes.
+
 ## [0.2.0] - 2026-11-09
 
 ### Added
