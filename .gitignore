@@ -1,5 +1,6 @@
 /target
 stub/target
+__pycache__/
 .env
 .DS_Store
 .idea/
