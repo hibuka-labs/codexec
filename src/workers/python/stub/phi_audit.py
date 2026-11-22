@@ -71,14 +71,23 @@ def is_pseudo_path(path):
     """Compile/exec labels — not effect targets. CPython's error rendering
     fetches source lines for them (a failed `ast.parse` in the traceback
     caret extraction opens `<unknown>`; a D2 syntax error opens `<cell N>`),
-    and those fetches must not become ledger rows. Residual hole (§8.4): a
-    real file literally named `<unknown>` etc. would pass silent."""
+    and those fetches must not become ledger rows. The same rendering
+    re-compiles the offending snippet to offer a keyword fix, through
+    `codeop.compile_command` — whose default filename is the literal
+    `<input>`; that open is an artifact of the same shape and must not
+    become a row either. Residual hole (§8.4): a real file literally named
+    `<unknown>` or `<input>` etc. would pass silent."""
     if not isinstance(path, str):
         return False  # int paths are open fds — real targets
     if path in ("<unknown>", "<string>", "<stdin>", "<console>",
-                "<install>", "<cell>"):
+                "<install>", "<cell>", "<input>"):
         return True
-    return path.startswith("<cell ") and path.endswith(">")
+    if path.startswith("<cell ") and path.endswith(">"):
+        return True  # `<cell N>` — this worker's own per-cell label
+    # CPython mints every other compile/label pseudo-path in the same
+    # `<...>` shape (`<frozen importlib._bootstrap>`, `<input>`, ...); a
+    # label is never a path.
+    return path.startswith("<") and path.endswith(">")
 
 
 def open_rw(mode, flags):
