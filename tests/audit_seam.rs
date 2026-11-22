@@ -272,24 +272,36 @@ async fn loading_a_library_through_ctypes_is_a_process_row() {
     )
     .await;
 
-    let obs = executor
-        .execute(vec![cell(
-            "load native code",
-            "import ctypes; ctypes.CDLL(None)".into(),
-        )])
-        .await;
+    // The library is named per platform, because `ctypes.CDLL(None)` — the
+    // "load the current process image" idiom — is not portable: on Windows
+    // `CDLL.__init__` does `'/' in name` on the name it was handed, and
+    // `None` raises `TypeError: argument of type 'NoneType' is not
+    // iterable` before any library is loaded.
+    //
+    // The audit event count differs by platform too, so the assertion is
+    // "at least one dlopen", not an exact count: on Unix `import ctypes`
+    // itself binds the process image (`pythonapi = PyDLL(None)`) and the
+    // explicit load is a second one; on Windows `PyDLL` is handed the
+    // already-loaded `dllhandle` and emits nothing, leaving one.
+    let code = if cfg!(windows) {
+        r#"import ctypes; ctypes.CDLL("kernel32.dll")"#.to_string()
+    } else {
+        r#"import ctypes; ctypes.CDLL(None)"#.to_string()
+    };
+
+    let obs = executor.execute(vec![cell("load native code", code)]).await;
     assert!(obs.error.is_none(), "{obs:?}");
 
-    // Two real loads: `import ctypes` itself binds the process image
-    // (`pythonapi = PyDLL(None)` in its module body), then CDLL(None).
     // No `ctypes.dlsym` rows — the namespace snapshot must not poke
     // `__getattr__` (ctypes resolves any attribute as a symbol lookup).
     let rows = rows(&journal_path);
-    assert_eq!(
-        call_fns(&rows),
-        ["ctypes.dlopen", "ctypes.dlopen"],
-        "{rows:?}"
-    );
+    let dlopens = calls(&rows)
+        .iter()
+        .filter(
+            |c| matches!(&c.audited, Audited::Call { fn_name, .. } if fn_name == "ctypes.dlopen"),
+        )
+        .count();
+    assert!(dlopens >= 1, "the load must be mediated: {rows:?}");
     for call in calls(&rows) {
         assert_facts(call, "ctypes.dlopen", Capability::Process);
     }
