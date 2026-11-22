@@ -278,11 +278,17 @@ async fn loading_a_library_through_ctypes_is_a_process_row() {
     // `None` raises `TypeError: argument of type 'NoneType' is not
     // iterable` before any library is loaded.
     //
-    // The audit event count differs by platform too, so the assertion is
-    // "at least one dlopen", not an exact count: on Unix `import ctypes`
-    // itself binds the process image (`pythonapi = PyDLL(None)`) and the
-    // explicit load is a second one; on Windows `PyDLL` is handed the
-    // already-loaded `dllhandle` and emits nothing, leaving one.
+    // The mediated event differs by platform too, so the assertion is "at
+    // least one Process-class ctypes row", not an exact count nor a
+    // specific event name: on Unix `import ctypes` itself binds the
+    // process image (`pythonapi = PyDLL(None)`) and the explicit load is a
+    // second one, both `ctypes.dlopen`; on Windows `PyDLL` is handed the
+    // already-loaded `dllhandle`, so `CDLL._load_library` returns it
+    // without calling `_LoadLibrary` — no `ctypes.dlopen` at all — and the
+    // load shows up as the `ctypes.dlsym` of the symbol lookup. Both are
+    // the same class under the audit contract (`src/audit.rs` maps
+    // `ctypes.dlopen` and `ctypes.dlsym` to `Process`): past the bind
+    // point a ctypes call is arbitrary native code.
     let code = if cfg!(windows) {
         r#"import ctypes; ctypes.CDLL("kernel32.dll")"#.to_string()
     } else {
@@ -292,18 +298,28 @@ async fn loading_a_library_through_ctypes_is_a_process_row() {
     let obs = executor.execute(vec![cell("load native code", code)]).await;
     assert!(obs.error.is_none(), "{obs:?}");
 
-    // No `ctypes.dlsym` rows — the namespace snapshot must not poke
-    // `__getattr__` (ctypes resolves any attribute as a symbol lookup).
+    // The namespace snapshot must not poke `__getattr__` (ctypes resolves
+    // any attribute as a symbol lookup), so the only rows here are the
+    // load's own events — all of them ctypes binds under `Process`.
     let rows = rows(&journal_path);
-    let dlopens = calls(&rows)
+    let ctypes_rows = calls(&rows)
         .iter()
-        .filter(
-            |c| matches!(&c.audited, Audited::Call { fn_name, .. } if fn_name == "ctypes.dlopen"),
-        )
+        .filter(|c| {
+            matches!(&c.audited, Audited::Call { fn_name, .. }
+                if fn_name == "ctypes.dlopen" || fn_name == "ctypes.dlsym")
+        })
         .count();
-    assert!(dlopens >= 1, "the load must be mediated: {rows:?}");
+    assert!(ctypes_rows >= 1, "the load must be mediated: {rows:?}");
     for call in calls(&rows) {
-        assert_facts(call, "ctypes.dlopen", Capability::Process);
+        let fn_name = match &call.audited {
+            Audited::Call { fn_name, .. } => fn_name.as_str(),
+            other => panic!("expected a call row, got {other:?}"),
+        };
+        assert!(
+            fn_name == "ctypes.dlopen" || fn_name == "ctypes.dlsym",
+            "only a ctypes bind may be mediated here: {call:?}"
+        );
+        assert_facts(call, fn_name, Capability::Process);
     }
 }
 
