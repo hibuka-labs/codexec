@@ -5,6 +5,9 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+mod common;
+use common::py_str;
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_codexec")
 }
@@ -125,7 +128,10 @@ fn deny_process_holds_journals_and_halts_the_step() {
 
     let out = run(
         &[
-            &format!("sh.run(\"touch {}\")", target.display()),
+            // The command goes in as a Python string literal: a Windows path
+            // is `C:\Users\...`, and raw in the source text the `\U` starts a
+            // unicode escape and the cell dies before the effect is tried.
+            &format!("sh.run({})", py_str(&format!("touch {}", target.display()))),
             "print(\"after\")",
         ],
         Some("deny-process"),
