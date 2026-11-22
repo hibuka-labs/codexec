@@ -607,6 +607,34 @@ impl Worker for PythonWorker {
         self.stderr_ring.stack_dump()
     }
 
+    /// Wait briefly for the dump to land, then read it.
+    ///
+    /// The dump rides the worker's stderr, so it reaches the host through the
+    /// drain task — a *different* task than the one that timed out. Reading
+    /// the ring the instant the deadline trips is a race with that task: on a
+    /// loaded machine the drain has not been scheduled yet, and the round
+    /// dies without saying where it hung. The failure is real either way,
+    /// but the diagnosis is what the timeout is for.
+    ///
+    /// The wait is bounded: a dump that never lands must not hold the
+    /// timeout open.
+    async fn diagnostics_tail_after_grace(&mut self) -> Option<String> {
+        /// How long the drain gets to deliver a dump that is already written.
+        const GRACE: std::time::Duration = std::time::Duration::from_millis(300);
+        /// How often the ring is polled while waiting.
+        const POLL: std::time::Duration = std::time::Duration::from_millis(10);
+        let deadline = tokio::time::Instant::now() + GRACE;
+        loop {
+            if let Some(tail) = self.stderr_ring.stack_dump() {
+                return Some(tail);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    }
+
     fn kill(&mut self) {
         self.alive = false;
         let _ = self.child.start_kill();

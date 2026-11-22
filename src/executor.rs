@@ -177,7 +177,13 @@ impl<W: Worker> CodeCellExecutor<W> {
             None => {
                 // Read the stuck worker's stack dump before the kill (knife②):
                 // a timeout now says where the round hung, not just that it did.
-                let tail = self.worker.as_ref().and_then(|w| w.diagnostics_tail());
+                // The read waits briefly for the drain task to deliver the dump
+                // — reading the instant the deadline trips is a race with that
+                // task, and a lost race means the round dies mute.
+                let tail = match self.worker.as_mut() {
+                    Some(w) => w.diagnostics_tail_after_grace().await,
+                    None => None,
+                };
                 self.lose_worker();
                 let mut obs = Observation {
                     error: Some(ExecError::Timeout {

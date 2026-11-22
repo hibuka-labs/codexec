@@ -247,3 +247,40 @@ async fn timeout_error_says_where_it_stuck() {
         other => panic!("want a timeout with a stack dump, got {other:?}"),
     }
 }
+
+/// The dump must survive the timeout, not race it.
+///
+/// The dump rides the worker's stderr, so it reaches the host through the
+/// drain task — a different task than the one that timed out. Reading the
+/// ring the instant the deadline trips is a race with that task: on a loaded
+/// machine the drain has not been scheduled yet, and the round dies without
+/// saying where it hung. The macOS runner hit exactly that.
+///
+/// The deadline here is deliberately short, so the window between the
+/// worker's dump (at 90% of the deadline) and the host's read is narrow —
+/// the case where losing the race is most likely. It is a stress of that
+/// window, not a deterministic reproduction: on an idle machine both the
+/// old and the new path find the dump.
+#[tokio::test]
+async fn a_short_timeout_still_reports_where_it_stuck() {
+    let limits = Limits {
+        timeout_ms: 600,
+        ..Limits::default()
+    };
+    let (_dir, mut executor) = executor_with(AllowAll, limits).await;
+    let obs = executor
+        .execute(vec![cell("while True: pass\n".to_string())])
+        .await;
+    match obs.error {
+        Some(ExecError::Timeout {
+            where_it_stuck: Some(where_it_stuck),
+            ..
+        }) => {
+            assert!(
+                where_it_stuck.contains("<cell>"),
+                "the dump names the cell: {where_it_stuck}"
+            );
+        }
+        other => panic!("want a timeout with a stack dump, got {other:?}"),
+    }
+}

@@ -92,4 +92,17 @@ pub trait Worker: WorkerSink {
     fn diagnostics_tail(&self) -> Option<String> {
         None
     }
+
+    /// Wait (briefly) for a diagnostics dump to land, then read it.
+    ///
+    /// The dump rides the worker's stderr, so it reaches the host through the
+    /// drain task — a *different* task than the one that timed out. Without
+    /// this wait the timeout reads the ring before the drain has been
+    /// scheduled, and the round dies without saying where it hung: the
+    /// failure is real, but the diagnosis is lost. The wait is short (the
+    /// dump is written long before the deadline) and bounded (a dump that
+    /// never lands must not hold the timeout open).
+    async fn diagnostics_tail_after_grace(&mut self) -> Option<String> {
+        self.diagnostics_tail()
+    }
 }
