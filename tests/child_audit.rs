@@ -6,12 +6,24 @@
 //!
 //! Also here: the round's progress trail (what a run looked like while it
 //! ran) and the timeout stack dump (where a hung round was).
+//!
+//! The child-audit channel is a **Unix** transport (a Unix domain socket), so
+//! the tests that assert a child's effect is mediated at the chokepoint only
+//! hold where the channel is installed. On Windows the channel is not
+//! installed and a child's effects keep the documented blind spot — the
+//! `windows_` test below pins that shape, so the limitation is asserted
+//! rather than silently skipped.
 
 use codexec::{
-    Action, AllowAll, Audited, ClassPolicy, CodeCellExecutor, ExecError, ExecutorBuilder,
-    FileJournal, JournalHandle, Limits, PolicyDecision, PythonWorker,
+    Action, AllowAll, Audited, CodeCellExecutor, ExecError, ExecutorBuilder, FileJournal,
+    JournalHandle, Limits, PolicyDecision, PythonWorker,
 };
 use phi_cap::Capability;
+
+/// The read-only policy the Unix-only refusal test needs. On Windows no test
+/// asks for it, so the import is gated with the test.
+#[cfg(unix)]
+use codexec::ClassPolicy;
 
 mod common;
 use common::{py_path, py_str};
@@ -66,6 +78,7 @@ fn decisions_on(
         .collect()
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn child_python_write_lands_in_the_journal() {
     let limits = Limits::default();
@@ -95,6 +108,7 @@ async fn child_python_write_lands_in_the_journal() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn child_python_write_is_refused_under_read_only_policy() {
     // The sub-agent posture: reads pass, writes refuse — now for children too.
@@ -154,6 +168,37 @@ async fn the_worker_mediates_exactly_once() {
         vec![PolicyDecision::Allow],
         "one effect, one row — no double mediation"
     );
+}
+
+/// Windows has no child-audit channel (the transport is a Unix domain
+/// socket), so the child's write is **not** mediated: the file appears and the
+/// journal holds no write row for it. The parent's `subprocess.Popen` row is
+/// the only trace — the documented blind spot, pinned here so it stays a
+/// known shape instead of a surprise.
+#[cfg(not(unix))]
+#[tokio::test]
+async fn windows_child_write_is_not_mediated_the_channel_is_unix_only() {
+    let limits = Limits::default();
+    let (dir, mut executor) = executor_with(AllowAll, limits).await;
+    let marker = dir.path().join("child_wrote.txt");
+    let code = format!(
+        "import subprocess, sys\n\
+         subprocess.run([sys.executable, '-c', {child}], check=True)\n",
+        child = py_str(&format!("open({}, 'w').write('x')", py_path(&marker)))
+    );
+    let obs = executor.execute(vec![cell(code)]).await;
+    assert!(obs.error.is_none(), "cell ran clean: {:?}", obs.error);
+
+    // The write happened — no channel refused it.
+    assert_eq!(
+        std::fs::read_to_string(&marker).expect("marker readable"),
+        "x",
+        "without the channel the child's write is not refused"
+    );
+    // ...and nothing mediated it.
+    let rows = rows(&dir);
+    let writes = decisions_on(&rows, "open", Capability::WriteFs);
+    assert!(writes.is_empty(), "no channel, no row: {:?}", writes);
 }
 
 #[tokio::test]
