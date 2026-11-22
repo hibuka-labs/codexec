@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The child-process audit tests survive a Windows path.** The fixtures
+  interpolated a raw path into Python *source text*, and a Windows path is
+  `C:\Users\me\file.txt` — Python reads the `\U` as the start of a unicode
+  escape and the cell dies with "'unicodeescape' codec can't decode bytes"
+  before the code under test ever runs. The paths now go into the cell as
+  proper Python string literals, so the value the cell sees is the path and
+  nothing else.
+
 ## [0.2.1] - 2026-11-16
 
 ### Fixed

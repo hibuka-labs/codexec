@@ -13,6 +13,9 @@ use codexec::{
 };
 use phi_cap::Capability;
 
+mod common;
+use common::{py_path, py_str};
+
 async fn executor_with(
     policy: impl codexec::Policy + 'static,
     limits: Limits,
@@ -70,8 +73,8 @@ async fn child_python_write_lands_in_the_journal() {
     let marker = dir.path().join("child_wrote.txt");
     let code = format!(
         "import subprocess, sys\n\
-         subprocess.run([sys.executable, '-c', \"open('{marker}', 'w').write('x')\"], check=True)\n",
-        marker = marker.display()
+         subprocess.run([sys.executable, '-c', {child}], check=True)\n",
+        child = py_str(&format!("open({}, 'w').write('x')", py_path(&marker)))
     );
     let obs = executor.execute(vec![cell(code)]).await;
     assert!(obs.error.is_none(), "cell ran clean: {:?}", obs.error);
@@ -104,10 +107,10 @@ async fn child_python_write_is_refused_under_read_only_policy() {
     let marker = dir.path().join("child_wrote.txt");
     let code = format!(
         "import subprocess, sys\n\
-         r = subprocess.run([sys.executable, '-c', \"open('{marker}', 'w').write('x')\"],\n\
+         r = subprocess.run([sys.executable, '-c', {child}],\n\
          \x20                  capture_output=True, text=True)\n\
          assert r.returncode != 0, 'the child write must be refused'\n",
-        marker = marker.display()
+        child = py_str(&format!("open({}, 'w').write('x')", py_path(&marker)))
     );
     let obs = executor.execute(vec![cell(code)]).await;
 
@@ -139,8 +142,8 @@ async fn the_worker_mediates_exactly_once() {
     let (dir, mut executor) = executor_with(AllowAll, limits).await;
     let marker = dir.path().join("worker_wrote.txt");
     let code = format!(
-        "open({marker:?}, 'w').write('x')\n",
-        marker = marker.display().to_string()
+        "open({marker}, 'w').write('x')\n",
+        marker = py_path(&marker)
     );
     let obs = executor.execute(vec![cell(code)]).await;
     assert!(obs.error.is_none(), "cell ran clean: {:?}", obs.error);
