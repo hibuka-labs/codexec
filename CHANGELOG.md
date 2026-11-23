@@ -31,6 +31,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now run on the platforms that have the channel, and Windows gets a test
   that pins the blind spot instead: the child's write lands and the journal
   holds no row for it. The limitation stays asserted, not skipped.
+- **A half-written stack dump is not a diagnosis.** The host drains the
+  worker's stderr line by line, so the dump's start marker can land while
+  the body is still in flight — the reader then handed back a truncated dump,
+  which looks like "here is where it hung" while naming nothing. The dump is
+  now bracketed by markers and is only read once its end marker says the
+  body is whole; a dump still in flight never hides the complete one before
+  it.
+- **The dump does not need the host to land.** It is written straight to fd 2
+  rather than through a buffered file object: opening a file fires an
+  audited `open` event, and the mediation round trip then blocks on a host
+  that has already stopped listening — the dump never landed and the timeout
+  said nothing about where the round hung.
 
 ## [0.2.1] - 2026-11-16
 

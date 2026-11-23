@@ -427,16 +427,42 @@ def _done(rid, phase, started, exit_code, error=None, stopped_at=None):
     })
 
 
+class _Fd2:
+    """fd 2 as a file-like, for `faulthandler`.
+
+    The dump must not need the host: it is emitted precisely when the host
+    has stopped listening. `os.fdopen(2, "w")` fires an audited `open`
+    event, and the mediation round trip then blocks on a host that is
+    already gone — the dump never lands and the timeout says nothing about
+    where the round hung. A duck-typed file that only names fd 2 writes the
+    same bytes with no audited event at all.
+    """
+
+    def fileno(self):
+        return 2
+
+    def write(self, text):
+        return os.write(2, text.encode("utf-8", "replace"))
+
+    def flush(self):
+        pass
+
+
 def _dump_stack():
     """Where every thread is stuck, on fd 2 (the host drains stderr into the
-    ring the timeout error reads). Marker first so the host can find the dump
-    among ordinary diagnostics."""
+    ring the timeout error reads). Bracketed by markers: the host reads
+    stderr line by line, so the start marker can arrive while the body is
+    still in flight — the end marker is what tells the host the body is
+    whole, and a truncated dump looks like a diagnosis while naming nothing.
+    """
     try:
         os.write(2, b"\n===PHI_STACK_DUMP===\n")
         import faulthandler
-        faulthandler.dump_traceback(file=os.fdopen(2, "w", closefd=False))
+        faulthandler.dump_traceback(file=_Fd2())
+        os.write(2, b"===PHI_STACK_DUMP_END===\n")
     except Exception:
-        pass
+        import traceback; traceback.print_exc(file=sys.stderr)
+        os.write(2, b"===PHI_STACK_DUMP_END===\n")
 
 
 def _heartbeat(rid, started, timeout_ms, stop):

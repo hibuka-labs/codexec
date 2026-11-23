@@ -55,13 +55,48 @@ impl StderrRing {
         q.push_back(line.to_string());
     }
 
-    /// Everything after the last stack-dump marker (knife②), capped — or
-    /// [`None`] when no dump landed (the round died before the worker could
-    /// say where it hung).
+    /// The stack dump, but only once it is **whole**.
+    ///
+    /// The worker brackets the dump with markers: the host drains stderr line
+    /// by line, so the start marker can land while the body is still in
+    /// flight. Reading everything after the start marker would then hand back
+    /// a truncated dump — which looks like a diagnosis while naming nothing
+    /// (the symptom the timeout test caught). The end marker is what says the
+    /// body is complete.
+    ///
+    /// Returns [`None`] when no *complete* dump landed: either the round died
+    /// before the worker could say where it hung, or the dump is still in
+    /// flight. The caller waits for it (see
+    /// [`diagnostics_tail_after_grace`]); a half-written dump is never
+    /// mistaken for a diagnosis.
     fn stack_dump(&self) -> Option<String> {
         let q = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let start = q.iter().rposition(|l| l.trim() == "===PHI_STACK_DUMP===")? + 1;
-        let body: String = q.iter().skip(start).cloned().collect::<Vec<_>>().join("\n");
+        // The last *complete* dump wins: the worker re-dumps on every tick
+        // after the deadline, so the ring can hold several dumps and the one
+        // in flight (no end marker yet) must not hide the complete one
+        // before it.
+        let mut body: Option<String> = None;
+        let mut current: Option<Vec<String>> = None;
+        for line in q.iter() {
+            let line = line.trim();
+            if line == "===PHI_STACK_DUMP===" {
+                current = Some(Vec::new());
+                continue;
+            }
+            if line == "===PHI_STACK_DUMP_END===" {
+                if let Some(lines) = current.take() {
+                    body = Some(lines.join("\n"));
+                }
+                continue;
+            }
+            if let Some(lines) = current.as_mut() {
+                lines.push(line.to_string());
+            }
+        }
+        let body = body?;
+        if body.trim().is_empty() {
+            return None;
+        }
         Some(body.chars().take(2000).collect())
     }
 }
@@ -685,5 +720,47 @@ mod tests {
         stderr.read_to_end(&mut seen).await.expect("drain");
         assert_eq!(seen, b"FD2LEAK\n");
         let _ = child.wait().await;
+    }
+
+    /// Regression (a truncated dump is not a diagnosis).
+    ///
+    /// The host drains stderr line by line, so the start marker can land
+    /// while the dump body is still in flight. Reading everything after the
+    /// start marker handed back a half-written dump — a timeout that says
+    /// "here is where it hung" while naming nothing. The end marker is what
+    /// says the body is whole.
+    ///
+    /// A dump with no end marker is not readable at all.
+    #[test]
+    fn a_dump_without_its_end_marker_is_not_a_diagnosis() {
+        let ring = StderrRing::default();
+        // The marker landed; the body is still in flight.
+        ring.push("===PHI_STACK_DUMP===");
+        ring.push("  File \"/tmp/cell.py\", line 1");
+        assert!(
+            ring.stack_dump().is_none(),
+            "a half-written dump must not be handed back"
+        );
+        // The body completes — now it is readable.
+        ring.push("===PHI_STACK_DUMP_END===");
+        let dump = ring.stack_dump().expect("the complete dump is readable");
+        assert!(dump.contains("cell.py"), "{dump}");
+    }
+
+    /// A dump still in flight must not hide the complete one before it: the
+    /// worker re-dumps on every tick after the deadline, so the ring holds
+    /// several dumps and the newest one may be incomplete.
+    #[test]
+    fn an_in_flight_dump_does_not_hide_the_complete_one_before_it() {
+        let ring = StderrRing::default();
+        ring.push("===PHI_STACK_DUMP===");
+        ring.push("  File \"/tmp/cell.py\", line 1");
+        ring.push("===PHI_STACK_DUMP_END===");
+        // The next dump is still being written.
+        ring.push("===PHI_STACK_DUMP===");
+        ring.push("  File \"/tmp/cell.py\", line 2");
+        let dump = ring.stack_dump().expect("the earlier complete dump stands");
+        assert!(dump.contains("line 1"), "{dump}");
+        assert!(!dump.contains("line 2"), "{dump}");
     }
 }
